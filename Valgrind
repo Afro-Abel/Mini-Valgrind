@@ -1,0 +1,308 @@
+#define M61_DISABLE 1
+#include "dmalloc.hh"
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <cinttypes>
+#include <cassert>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
+#include <iostream>
+#include <iomanip>
+
+std::unordered_map<std::string, size_t> allocation_map;
+
+
+#define CANARY_SIZE 200
+#define PATTERN 0xDEADBEEF
+
+typedef struct metadata{
+    size_t sz;
+    metadata *prev = NULL;
+    metadata *next = NULL;
+    char* file;
+    long line;
+    
+}metadata;
+
+
+metadata *head = NULL;
+
+dmalloc_statistics info = {
+    0,  
+    0,  
+    0,  
+    0,  
+    0,  
+    0,  
+    UINTPTR_MAX,
+    0   
+};
+
+
+
+
+/// dmalloc_malloc(sz, file, line)
+///    Return a pointer to `sz` bytes of newly-allocated dynamic memory.
+///    The memory is not initialized. If `sz == 0`, then dmalloc_malloc must
+///    return a unique, newly-allocated pointer value. The allocation
+///    request was at location `file`:`line`.
+
+void* dmalloc_malloc(size_t sz, const char* file, long line) {
+    
+    (void)file, (void)line;
+
+    if(sz > SIZE_MAX - (2 * CANARY_SIZE + sizeof(metadata))){
+        info.nfail++;
+        info.fail_size += sz;
+        return NULL;
+    }
+
+    void *ptr = base_malloc(sz + 2*CANARY_SIZE + sizeof(metadata));
+
+    if (!ptr){
+        info.nfail++;
+        info.fail_size += sz;
+        return NULL;
+    }
+
+    metadata *meta = (metadata*)ptr;
+    meta->sz = sz;
+    meta->prev = NULL;
+    meta->next = NULL;
+    meta->file = strdup(file);
+    meta->line = line;
+
+    if (head == NULL) {
+        head = meta;
+    } 
+    else{
+        meta->prev = head;
+        head->next = meta;
+        head = meta;
+    }
+
+    uintptr_t *first_canary = (uintptr_t *)((char*)ptr + sizeof(metadata));
+    uintptr_t *payload_begin = (uintptr_t *)((char*)first_canary + CANARY_SIZE);
+    uintptr_t *second_canary = (uintptr_t *)((char*)payload_begin + sz);
+
+    for (size_t i = 0; i < CANARY_SIZE / sizeof(uint32_t); i++) {
+        ((uint32_t*)first_canary)[i] = PATTERN;
+        ((uint32_t*)second_canary)[i] = PATTERN;
+    }
+
+    info.ntotal++;
+    info.nactive++;
+    info.active_size += sz;
+    info.total_size += sz;
+
+    if ((uintptr_t)payload_begin < info.heap_min) {
+        info.heap_min = (uintptr_t)payload_begin;
+    }
+    
+    if ((uintptr_t)payload_begin + sz > info.heap_max) {
+        info.heap_max = (uintptr_t)payload_begin + sz;
+    }
+
+    // Create key as concatenation of file and line
+    std::string key = std::string(file) + ":" + std::to_string(line);
+
+    // Update hash map
+    if (allocation_map.find(key) != allocation_map.end()) {
+        allocation_map[key] += sz;
+    } else {
+        allocation_map[key] = sz;
+    }
+
+    return (void*)payload_begin;
+}
+
+
+
+
+
+/// dmalloc_free(ptr, file, line)
+///    Free the memory space pointed to by `ptr`, which must have been
+///    returned by a previous call to dmalloc_malloc. If `ptr == NULL`,
+///    does nothing. The free was called at location `file`:`line`.
+
+void dmalloc_free(void* ptr, const char* file, long line) {
+
+    (void)file, (void)line;
+
+    if (ptr == NULL){
+        return;
+    }
+
+    if ((uintptr_t)ptr < info.heap_min || (uintptr_t)ptr > info.heap_max) {
+        fprintf(stderr, "MEMORY BUG???: invalid free of pointer ???, not in heap\n");
+        abort();
+    }
+
+    metadata* meta = (metadata*)((char*)ptr - CANARY_SIZE - sizeof(metadata));    
+    
+    if(meta->sz == SIZE_MAX){
+        fprintf(stderr, "MEMORY BUG: %s:%ld: invalid free of pointer %p, double free\n", file, line, ptr);
+        abort();
+    }
+
+metadata *temp = head;
+
+while (temp != NULL) {
+    void *payload_begin = (void *)((char *)temp + sizeof(metadata) + CANARY_SIZE);
+    void *payload_end = (void *)((char *)payload_begin + temp->sz);
+
+    if ((uintptr_t)ptr > (uintptr_t)payload_begin && (uintptr_t)ptr < (uintptr_t)payload_end) {
+        fprintf(stderr, "MEMORY BUG: %s:%ld: invalid free of pointer %p, not allocated\n", file, line, ptr);
+        fprintf(stderr, "  %s:%ld: %p is %zu bytes inside a %zu byte region allocated here\n", file, temp->line, ptr, (uintptr_t)ptr - (uintptr_t)payload_begin, temp->sz);
+        fprintf(stderr, "%p\n", ptr);
+
+        abort();
+    }
+    temp = temp->prev;
+}
+
+    uintptr_t  *first_canary = (uintptr_t *)((char*)ptr - CANARY_SIZE);
+    uintptr_t  *second_canary = (uintptr_t *)((char*)first_canary + CANARY_SIZE + meta->sz);
+    
+    for (size_t i = 0; i < CANARY_SIZE / sizeof(uint32_t); i++) {
+        if (((uint32_t*)first_canary)[i] != PATTERN) {
+            fprintf(stderr, "MEMORY BUG???: detected wild write during free of pointer %p\n", ptr);
+            abort();
+        }
+    }
+    
+    for (size_t i = 0; i < CANARY_SIZE / sizeof(uint32_t); i++) {
+        if (((uint32_t*)second_canary)[i] != PATTERN) {
+            fprintf(stderr, "MEMORY BUG???: detected wild write during free of pointer %p\n", ptr);
+            abort();
+        }
+    }
+    
+   
+
+    if (meta == head) {  
+        head = meta->prev;
+        if (head){
+            head->next = NULL; 
+        }
+    } else {
+        if (meta->prev){
+            meta->prev->next = meta->next;
+        }
+    }
+
+    if (meta->next) {
+        meta->next->prev = meta->prev;
+    }
+
+    meta->next = NULL;
+    meta->prev = NULL;
+
+    info.nactive--;    
+    info.active_size -= meta->sz;
+    meta->sz = SIZE_MAX;
+
+    base_free((void*)meta);
+}
+
+/// dmalloc_calloc(nmemb, sz, file, line)
+///    Return a pointer to newly-allocated dynamic memory big enough to
+///    hold an array of `nmemb` elements of `sz` bytes each. If `sz == 0`,
+///    then must return a unique, newly-allocated pointer value. Returned
+///    memory should be initialized to zero. The allocation request was at
+///    location `file`:`line`.
+
+void* dmalloc_calloc(size_t nmemb, size_t sz, const char* file, long line) {
+    if (nmemb > SIZE_MAX / sz) {  
+            info.nfail++;
+            info.fail_size += sz;
+            return NULL;
+        }
+
+    void* ptr = dmalloc_malloc(nmemb * sz, file, line);
+    if (ptr) {
+        memset(ptr, 0, nmemb * sz);
+    }
+    return ptr;
+}
+
+/// dmalloc_get_statistics(stats)
+///    Store the current memory statistics in `*stats`.
+
+void dmalloc_get_statistics(dmalloc_statistics* stats) {
+    // Stub: set all statistics to enormous numbers
+    memset(stats, 255, sizeof(dmalloc_statistics));
+    // Your code here.
+    stats->nactive = info.nactive;
+    stats->active_size = info.active_size;
+    stats->ntotal = info.ntotal;
+    stats->total_size = info.total_size;
+    stats->nfail = info.nfail;
+    stats->fail_size = info.fail_size;
+    stats->heap_min = info.heap_min;
+    stats->heap_max = info.heap_max;   
+}
+
+
+/// dmalloc_print_statistics()
+///    Print the current memory statistics.
+
+void dmalloc_print_statistics(){
+    dmalloc_statistics stats;
+    dmalloc_get_statistics(&stats);
+
+    printf("alloc count: active %10llu   total %10llu   fail %10llu\n",
+           stats.nactive, stats.ntotal, stats.nfail);
+    printf("alloc size:  active %10llu   total %10llu   fail %10llu\n",
+           stats.active_size, stats.total_size, stats.fail_size);
+}
+
+
+/// dmalloc_print_leak_report()
+///    Print a report of all currently-active allocated blocks of dynamic
+///    memory.
+
+void dmalloc_print_leak_report(){
+    metadata *curr = head;
+    uintptr_t *payload_begin = (uintptr_t *)((char*)curr + sizeof(metadata) + CANARY_SIZE);
+    while (curr != NULL) {
+        printf("LEAK CHECK: %s:%ld: allocated object %p with size %zu\n", curr->file, curr->line, payload_begin, curr->sz);
+        curr = curr->prev;
+    }
+}
+
+
+/// dmalloc_print_heavy_hitter_report()
+///    Print a report of heavily-used allocation locations.
+
+void dmalloc_print_heavy_hitter_report() {
+    if (allocation_map.empty()) {
+        std::cout << "No allocations recorded.\n";
+        return;
+    }
+
+    // Compute total allocated size
+    size_t total_allocated = 0;
+    for (const auto& entry : allocation_map) {
+        total_allocated += entry.second;
+    }
+
+    // Copy map contents into a vector and sort in descending order by size
+    std::vector<std::pair<std::string, size_t>> sorted_entries(allocation_map.begin(), allocation_map.end());
+    std::sort(sorted_entries.begin(), sorted_entries.end(), 
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    // Print only entries that are 20% or more of total allocations
+    for (const auto& entry : sorted_entries) {
+        double percentage = (entry.second * 100.0) / total_allocated;
+        if (percentage >= 20.0) {
+            std::cout << "HEAVY HITTER: " << entry.first << ": " 
+                      << entry.second << " bytes (~" 
+                      << std::fixed << std::setprecision(1) << percentage << "%)\n";
+        } else {
+            break; // Stop checking once we go below 20%
+        }
+    }
+}
